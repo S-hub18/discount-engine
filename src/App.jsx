@@ -5,12 +5,15 @@
  * Wires together CSV upload → parse → engine → display.
  */
 
-import { useState } from 'react'
+import { useState, useSyncExternalStore } from 'react'
 import CsvUploader from './components/CsvUploader.jsx'
+import PdfUploader from './components/PdfUploader.jsx'
 import DataTable from './components/DataTable.jsx'
 import ErrorBanner from './components/ErrorBanner.jsx'
+import NLRuleParser from './ui/NLRuleParser.jsx'
 import { parseRulesCSV, parseCartCSV } from './engine/csvParser.js'
-import { processCart, cartTotal } from './engine/discountEngine.js'
+import cartStore from './state/cartStore'
+import { extractPdfCart } from './adapters/pdf/orchestrator'
 
 // ── Column definitions ───────────────────────────────────────────
 
@@ -33,6 +36,31 @@ const CART_COLUMNS = [
   { key: 'brand',     label: 'Brand' },
   { key: 'platform',  label: 'Platform' },
   { key: 'basePrice', label: 'Base Price', render: (v) => `Rs.${v.toLocaleString('en-IN')}` },
+]
+
+const CART_ISSUE_COLUMNS = [
+  { key: 'rowNumber', label: 'Row' },
+  {
+    key: 'product',
+    label: 'Product',
+    render: (_, row) => row.row?.product ?? '—',
+  },
+  {
+    key: 'brand',
+    label: 'Brand',
+    render: (_, row) => row.row?.brand ?? '—',
+  },
+  {
+    key: 'platform',
+    label: 'Platform',
+    render: (_, row) => row.row?.platform ?? '—',
+  },
+  {
+    key: 'basePrice',
+    label: 'Base Price',
+    render: (_, row) => row.row?.basePrice ?? '—',
+  },
+  { key: 'reason', label: 'Reason' },
 ]
 
 const RESULTS_COLUMNS = [
@@ -94,8 +122,31 @@ const S = {
     gap: '1rem', marginTop: '0.75rem', paddingTop: '0.75rem',
     borderTop: '2px solid #131A48',
   },
+  summaryBlock: {
+    marginTop: '0.75rem',
+    paddingTop: '0.75rem',
+    borderTop: '1px solid #E4E4E8',
+    display: 'grid',
+    gap: '0.5rem',
+  },
+  nudge: {
+    padding: '0.7rem 0.85rem',
+    borderRadius: 6,
+    border: '1px solid #F1C97B',
+    background: '#FFF7E7',
+    color: '#8A5600',
+    fontSize: 12,
+    fontWeight: 700,
+  },
+  summaryRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: '1rem',
+  },
   totalLabel: { fontWeight: 700, fontSize: 14, color: '#131A48' },
   totalValue: { fontWeight: 700, fontSize: 16, color: '#131A48' },
+  offerValue: { fontWeight: 700, fontSize: 15, color: '#1e5c2c' },
   tag: (color, bg) => ({
     display: 'inline-block', fontSize: 10, fontWeight: 700, padding: '1px 6px',
     borderRadius: 20, background: bg, color, textTransform: 'uppercase', letterSpacing: '0.04em',
@@ -105,40 +156,45 @@ const S = {
 // ── Component ────────────────────────────────────────────────────
 
 export default function App() {
-  const [rules, setRules]           = useState([])
-  const [rulesErrors, setRulesErr]  = useState([])
-  const [rulesFileName, setRulesFileName] = useState('')
-
-  const [cartItems, setCartItems]   = useState([])
-  const [cartErrors, setCartErrors] = useState([])
-  const [cartFileName, setCartFileName]   = useState('')
-
-  const [results, setResults]       = useState(null)
+  const [isPdfBusy, setIsPdfBusy] = useState(false)
+  const cartSnapshot = useSyncExternalStore(
+    (listener) => cartStore.subscribe(listener),
+    () => cartStore.getSnapshot(),
+    () => cartStore.getSnapshot()
+  )
 
   // ── Handlers ──
 
   function handleRulesLoad(csvText, fileName) {
     const { data, errors } = parseRulesCSV(csvText)
-    setRules(data)
-    setRulesErr(errors)
-    setRulesFileName(fileName)
-    setResults(null) // clear stale results
+    cartStore.replaceRules(data, errors, fileName, 'csv')
   }
 
   function handleCartLoad(csvText, fileName) {
     const { data, errors } = parseCartCSV(csvText)
-    setCartItems(data)
-    setCartErrors(errors)
-    setCartFileName(fileName)
-    setResults(null)
+    cartStore.replaceCart(
+      data,
+      errors.map((reason, index) => ({ rowNumber: index + 2, row: null, reason })),
+      fileName,
+      'csv'
+    )
   }
 
-  function handleCalculate() {
-    const res = processCart(cartItems, rules)
-    setResults(res)
+  async function handlePdfLoad(file) {
+    setIsPdfBusy(true)
+    try {
+      await extractPdfCart(file)
+    } catch (error) {
+      cartStore.replaceCart(
+        [],
+        [{ rowNumber: 0, row: null, reason: error instanceof Error ? error.message : 'Failed to parse PDF cart' }],
+        file.name,
+        'pdf'
+      )
+    } finally {
+      setIsPdfBusy(false)
+    }
   }
-
-  const canCalculate = rules.length > 0 && cartItems.length > 0
 
   // ── Render ──
 
@@ -152,6 +208,12 @@ export default function App() {
 
       <div style={S.main}>
 
+        {/* Natural language rules */}
+        <div style={S.section}>
+          <div style={S.sectionTitle}>Natural Language Rule</div>
+          <NLRuleParser />
+        </div>
+
         {/* Upload row */}
         <div style={S.grid2}>
           {/* Rules upload */}
@@ -161,16 +223,16 @@ export default function App() {
               label="rules.csv"
               description="Upload your discount rules CSV"
               onLoad={handleRulesLoad}
-              hasData={rules.length > 0}
-              fileName={rulesFileName}
+              hasData={cartSnapshot.rules.length > 0}
+              fileName={cartSnapshot.ruleFileName}
             />
-            <ErrorBanner errors={rulesErrors} />
-            {rules.length > 0 && (
+            <ErrorBanner errors={cartSnapshot.ruleErrors} />
+            {cartSnapshot.rules.length > 0 && (
               <div style={{ marginTop: '0.75rem' }}>
                 <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>
-                  {rules.length} rule{rules.length > 1 ? 's' : ''} loaded
+                  {cartSnapshot.rules.length} rule{cartSnapshot.rules.length > 1 ? 's' : ''} loaded
                 </div>
-                <DataTable columns={RULES_COLUMNS} rows={rules} />
+                <DataTable columns={RULES_COLUMNS} rows={cartSnapshot.rules} />
               </div>
             )}
           </div>
@@ -182,45 +244,67 @@ export default function App() {
               label="cart.csv"
               description="Upload your cart CSV"
               onLoad={handleCartLoad}
-              hasData={cartItems.length > 0}
-              fileName={cartFileName}
+              hasData={cartSnapshot.cartItems.length > 0}
+              fileName={cartSnapshot.cartFileName}
             />
-            <ErrorBanner errors={cartErrors} />
-            {cartItems.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <PdfUploader
+                label="cart.pdf"
+                description="Upload the sample PDF cart"
+                onLoad={handlePdfLoad}
+                hasData={cartSnapshot.cartSource === 'pdf' && cartSnapshot.cartItems.length > 0}
+                fileName={cartSnapshot.cartFileName}
+                isBusy={isPdfBusy}
+              />
+            </div>
+
+            {cartSnapshot.cartIssues.length > 0 && (
               <div style={{ marginTop: '0.75rem' }}>
                 <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>
-                  {cartItems.length} item{cartItems.length > 1 ? 's' : ''} loaded
+                  {cartSnapshot.cartIssues.length} malformed row{cartSnapshot.cartIssues.length > 1 ? 's' : ''} flagged
                 </div>
-                <DataTable columns={CART_COLUMNS} rows={cartItems} />
+                <DataTable columns={CART_ISSUE_COLUMNS} rows={cartSnapshot.cartIssues} emptyMessage="No malformed rows." />
+              </div>
+            )}
+
+            {cartSnapshot.cartItems.length > 0 && (
+              <div style={{ marginTop: '0.75rem' }}>
+                <div style={{ fontSize: 11, color: '#888', marginBottom: 4 }}>
+                  {cartSnapshot.cartItems.length} item{cartSnapshot.cartItems.length > 1 ? 's' : ''} loaded
+                </div>
+                <DataTable columns={CART_COLUMNS} rows={cartSnapshot.cartItems} />
               </div>
             )}
           </div>
         </div>
 
-        {/* Calculate button */}
-        <div style={{ textAlign: 'center', marginBottom: '1.2rem' }}>
-          <button
-            style={canCalculate ? S.btn : S.btnDisabled}
-            onClick={handleCalculate}
-            disabled={!canCalculate}
-          >
-            Calculate Discounts
-          </button>
-          {!canCalculate && (
-            <div style={{ fontSize: 11, color: '#888', marginTop: 6 }}>
-              Upload both files to calculate
-            </div>
-          )}
+        <div style={{ textAlign: 'center', marginBottom: '1.2rem', fontSize: 11, color: '#666' }}>
+          Results update automatically when rules or cart items change.
         </div>
 
         {/* Results */}
-        {results && (
+        {(cartSnapshot.cartItems.length > 0 || cartSnapshot.rules.length > 0) && (
           <div style={S.section}>
             <div style={S.sectionTitle}>Cart Summary</div>
-            <DataTable columns={RESULTS_COLUMNS} rows={results} />
-            <div style={S.totalRow}>
-              <span style={S.totalLabel}>Cart Total</span>
-              <span style={S.totalValue}>Rs.{cartTotal(results).toLocaleString('en-IN')}</span>
+            <DataTable columns={RESULTS_COLUMNS} rows={cartSnapshot.pricedCart.pricedItems} />
+            <div style={S.summaryBlock}>
+              {cartSnapshot.cartOfferNudge && (
+                <div style={S.nudge}>{cartSnapshot.cartOfferNudge}</div>
+              )}
+              <div style={S.summaryRow}>
+                <span style={S.totalLabel}>Item total before cart offer</span>
+                <span style={S.totalValue}>Rs.{cartSnapshot.pricedCart.itemTotalBeforeCartOffer.toLocaleString('en-IN')}</span>
+              </div>
+              {cartSnapshot.pricedCart.cartOffer && (
+                <div style={S.summaryRow}>
+                  <span style={S.totalLabel}>Cart offer: {cartSnapshot.pricedCart.cartOffer.label}</span>
+                  <span style={S.offerValue}>-Rs.{cartSnapshot.pricedCart.cartOffer.amountSaved.toLocaleString('en-IN')}</span>
+                </div>
+              )}
+              <div style={S.totalRow}>
+                <span style={S.totalLabel}>Cart Total</span>
+                <span style={S.totalValue}>Rs.{cartSnapshot.pricedCart.finalCartTotal.toLocaleString('en-IN')}</span>
+              </div>
             </div>
           </div>
         )}
