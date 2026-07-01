@@ -1,8 +1,6 @@
 /**
  * CsvUploader.jsx
- *
- * Renders a file upload area for a single CSV file.
- * Calls onLoad(rawText) when a file is selected.
+ * Renders a dropzone for a single CSV file. Calls onLoad(rawText, fileName).
  */
 
 import { useRef } from 'react'
@@ -16,51 +14,24 @@ export default function CsvUploader({ label, description, onLoad, hasData, fileN
     const reader = new FileReader()
     reader.onload = (evt) => onLoad(evt.target.result, file.name)
     reader.readAsText(file)
-    // Reset input so the same file can be re-uploaded
-    e.target.value = ''
+    e.target.value = '' // allow re-uploading the same file
   }
 
   return (
     <div
-      style={{
-        border: `2px dashed ${hasData ? '#1e5c2c' : '#CECECE'}`,
-        borderRadius: 6,
-        padding: '1rem 1.2rem',
-        background: hasData ? '#f0faf2' : '#fafafa',
-        cursor: 'pointer',
-        transition: 'border-color 0.15s',
-      }}
+      className={`dropzone${hasData ? ' dropzone--ok' : ''}`}
       onClick={() => inputRef.current?.click()}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && inputRef.current?.click()}
     >
-      <input
-        ref={inputRef}
-        type="file"
-        accept=".csv"
-        style={{ display: 'none' }}
-        onChange={handleFile}
-      />
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-        <span style={{ fontSize: 20 }}>{hasData ? '✅' : '📄'}</span>
-        <div>
-          <div style={{ fontWeight: 700, fontSize: 13, color: '#131A48' }}>{label}</div>
-          <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>
-            {hasData ? fileName : description}
-          </div>
-        </div>
-        <div style={{ marginLeft: 'auto' }}>
-          <span
-            style={{
-              fontSize: 11,
-              fontWeight: 700,
-              color: hasData ? '#1e5c2c' : '#FF5800',
-              textTransform: 'uppercase',
-              letterSpacing: '0.05em',
-            }}
-          >
-            {hasData ? 'Change' : 'Upload'}
-          </span>
-        </div>
+      <input ref={inputRef} type="file" accept=".csv" style={{ display: 'none' }} onChange={handleFile} />
+      <span className="dropzone__icon">{hasData ? '✅' : '📄'}</span>
+      <div>
+        <div className="dropzone__label">{label}</div>
+        <div className="dropzone__hint">{hasData ? fileName : description}</div>
       </div>
+      <span className="dropzone__action">{hasData ? 'Change' : 'Upload'}</span>
     </div>
   )
 }

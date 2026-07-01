@@ -1,5 +1,23 @@
+/**
+ * extractRuleAgent.ts
+ *
+ * Turns a plain-English discount rule into a structured ExtractionResult.
+ *
+ * The extraction uses our langextract-style engine (see ./langextract.ts):
+ * a prompt + few-shot examples + a Zod schema + source grounding, run
+ * against Gemini. When no API key is configured (or the call fails) we fall
+ * back to a deterministic regex parser so the app — and its tests — work
+ * with zero external dependencies.
+ *
+ * The discount-rule *specifics* (examples, schema, prompt) live here; the
+ * generic extraction mechanics live in langextract.ts. That keeps "how we
+ * call an LLM" separate from "what a discount rule looks like".
+ */
+
 import { z } from 'zod'
-import { GoogleGenerativeAI } from '@google/generative-ai'
+import { extract, locateSpans, NO_API_KEY, type Example, type Grounding } from './langextract'
+
+// ── Schema & types ───────────────────────────────────────────────
 
 export const ExtractionSchema = z.object({
   scope: z.union([z.literal('platform'), z.literal('brand'), z.literal('cart')]).nullable(),
@@ -11,63 +29,102 @@ export const ExtractionSchema = z.object({
   confidence: z.union([z.literal('complete'), z.literal('partial'), z.literal('unresolvable')]),
 })
 
-export type ExtractionResult = z.infer<typeof ExtractionSchema>
+type ExtractionFields = z.infer<typeof ExtractionSchema>
 
-const LLM_TIMEOUT_MS = 10000
-
-function getRuntimeEnv(name: string): string | undefined {
-  if (typeof process !== 'undefined' && process.env && process.env[name]) {
-    return process.env[name]
-  }
-
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
-    const viteName = `VITE_${name}`
-    const env = (import.meta as any).env
-    return env[name] ?? env[viteName]
-  }
-
-  return undefined
+export type ExtractionResult = ExtractionFields & {
+  /** Which input phrase produced each field (langextract source grounding). */
+  grounding?: Grounding[]
+  /** 'gemini-...' when the LLM was used, 'heuristic' for the offline fallback. */
+  source?: string
 }
 
-function stripCodeFences(text: string) {
-  return text
-    .trim()
-    .replace(/^```(?:json)?/i, '')
-    .replace(/```$/i, '')
-    .trim()
-}
+// ── langextract configuration: prompt + few-shot examples ────────
 
-function parseGeminiJson(text: string): ExtractionResult {
-  const cleaned = stripCodeFences(text)
-  const parsed = JSON.parse(cleaned)
-  return ExtractionSchema.parse(parsed)
-}
+const PROMPT_DESCRIPTION = [
+  'You extract a single discount rule from a short sentence written by a',
+  'marketplace operator. Map it to these fields:',
+  '- scope: "platform" (e.g. Amazon India, Flipkart), "brand" (e.g. Natura Casa),',
+  '  or "cart" (a whole-order threshold offer). null if unclear.',
+  '- appliesTo: the platform or brand name. null for cart-scoped or unclear rules.',
+  '- type: "percentage" or "flat" (a fixed rupee amount). null if unclear.',
+  '- value: the number (15 for "15%", 100 for "Rs.100"). null if unclear.',
+  '- stackable: true if the text says it stacks/combines with other offers;',
+  '  false if it says non-stackable / not stackable / does not stack / no stacking;',
+  '  null only when the text is silent about stacking.',
+  '- minCartValue: for cart rules, the minimum cart total in rupees. null otherwise.',
+  '- confidence: "complete" if every required field is present, "partial" if some',
+  '  are present, "unresolvable" if the text gives no usable discount.',
+].join('\n')
 
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`NL extraction timed out after ${ms}ms`))
-    }, ms)
-
-    promise
-      .then((value) => {
-        clearTimeout(timer)
-        resolve(value)
-      })
-      .catch((error) => {
-        clearTimeout(timer)
-        reject(error)
-      })
-  })
-}
-
-// Primary function: try to call a Vercel AI SDK to produce structured output.
-// If an LLM isn't configured, fall back to a small deterministic parser
-// sufficient for the example inputs in the assignment brief.
-export async function extractRule(text: string): Promise<ExtractionResult> {
-  const sourceText = typeof text === 'string' ? text.trim() : ''
-  if (!sourceText) {
-    return {
+const RULE_EXAMPLES: Example<ExtractionFields>[] = [
+  {
+    text: '20% off for Natura Casa brand, stackable with other offers',
+    extraction: {
+      scope: 'brand',
+      appliesTo: 'Natura Casa',
+      type: 'percentage',
+      value: 20,
+      stackable: true,
+      minCartValue: null,
+      confidence: 'complete',
+    },
+    spans: { scope: 'Natura Casa brand', appliesTo: 'Natura Casa', value: '20%', stackable: 'stackable' },
+  },
+  {
+    text: 'Rs.100 flat discount on all Flipkart items',
+    extraction: {
+      scope: 'platform',
+      appliesTo: 'Flipkart',
+      type: 'flat',
+      value: 100,
+      stackable: null,
+      minCartValue: null,
+      confidence: 'complete',
+    },
+    spans: { appliesTo: 'Flipkart', type: 'flat', value: 'Rs.100' },
+  },
+  {
+    text: '10% off if cart value is more than Rs.5,000',
+    extraction: {
+      scope: 'cart',
+      appliesTo: null,
+      type: 'percentage',
+      value: 10,
+      stackable: null,
+      minCartValue: 5000,
+      confidence: 'complete',
+    },
+    spans: { scope: 'cart value', value: '10%', minCartValue: 'Rs.5,000' },
+  },
+  {
+    text: 'Flat 150 off for Nordic Basics',
+    extraction: {
+      scope: 'brand',
+      appliesTo: 'Nordic Basics',
+      type: 'flat',
+      value: 150,
+      stackable: null,
+      minCartValue: null,
+      confidence: 'complete',
+    },
+    spans: { appliesTo: 'Nordic Basics', type: 'flat', value: '150' },
+  },
+  {
+    text: 'Spend over 3000 and get 12 percent off',
+    extraction: {
+      scope: 'cart',
+      appliesTo: null,
+      type: 'percentage',
+      value: 12,
+      stackable: null,
+      minCartValue: 3000,
+      confidence: 'complete',
+    },
+    spans: { scope: 'Spend', value: '12 percent', minCartValue: 'over 3000' },
+  },
+  {
+    text: 'Give a discount for big orders',
+    extraction: {
       scope: null,
       appliesTo: null,
       type: null,
@@ -75,181 +132,315 @@ export async function extractRule(text: string): Promise<ExtractionResult> {
       stackable: null,
       minCartValue: null,
       confidence: 'unresolvable',
-    }
+    },
+    spans: {},
+  },
+]
+
+// ── Runtime env access (works under Node and Vite) ───────────────
+
+function getRuntimeEnv(name: string): string | undefined {
+  if (typeof process !== 'undefined' && process.env && process.env[name]) {
+    return process.env[name]
   }
 
-  const useLLM = getRuntimeEnv('NL_USE_LLM') === 'true'
-
-  // Attempt LLM call only when explicitly enabled.
-  if (useLLM) {
-    try {
-      const apiKey =
-        getRuntimeEnv('GEMINI_API_KEY') ||
-        getRuntimeEnv('GOOGLE_API_KEY') ||
-        getRuntimeEnv('GOOGLE_GEMINI_API_KEY')
-
-      if (!apiKey) {
-        return parseHeuristic(text)
-      }
-
-      const modelName = getRuntimeEnv('NL_MODEL') || 'gemini-1.5-flash'
-      const client = new GoogleGenerativeAI(apiKey)
-      const model = client.getGenerativeModel({ model: modelName })
-
-      const prompt = [
-        'Extract a discount rule from the following text.',
-        'Return ONLY valid JSON matching this schema:',
-        '{"scope":"platform"|"brand"|"cart"|null,"appliesTo":string|null,"type":"percentage"|"flat"|null,"value":number|null,"stackable":boolean|null,"minCartValue":number|null,"confidence":"complete"|"partial"|"unresolvable"}',
-        'If a field cannot be determined, set it to null and confidence to "unresolvable" or "partial". Do not guess.',
-        `Text: ${JSON.stringify(sourceText)}`,
-      ].join('\n')
-
-      const result = await withTimeout(model.generateContent(prompt), LLM_TIMEOUT_MS)
-      const responseText = result.response.text()
-      return parseGeminiJson(responseText)
-    } catch (e) {
-      // Fall through to deterministic parser below
-    }
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+    const env = (import.meta as any).env
+    return env[name] ?? env[`VITE_${name}`]
   }
 
-  return parseHeuristic(sourceText)
+  return undefined
 }
 
-function parseHeuristic(text: string): ExtractionResult {
+function resolveApiKey(): string | undefined {
+  return (
+    getRuntimeEnv('GEMINI_API_KEY') ||
+    getRuntimeEnv('GOOGLE_API_KEY') ||
+    getRuntimeEnv('GOOGLE_GEMINI_API_KEY')
+  )
+}
+
+// ── Public API ───────────────────────────────────────────────────
+
+const EMPTY_UNRESOLVABLE: ExtractionResult = {
+  scope: null,
+  appliesTo: null,
+  type: null,
+  value: null,
+  stackable: null,
+  minCartValue: null,
+  confidence: 'unresolvable',
+}
+
+/**
+ * Extract a discount rule from text.
+ *
+ * Strategy: if a Gemini key is configured, use the langextract engine
+ * (few-shot + schema + grounding). Otherwise — or if that call fails for
+ * any reason — fall back to the deterministic heuristic parser. The caller
+ * always gets a valid ExtractionResult; it never throws on a missing key.
+ */
+export async function extractRule(text: string): Promise<ExtractionResult> {
+  const sourceText = typeof text === 'string' ? text.trim() : ''
+  if (!sourceText) {
+    return EMPTY_UNRESOLVABLE
+  }
+
+  // Allow explicitly forcing the offline parser (e.g. deterministic tests).
+  const forceHeuristic = getRuntimeEnv('NL_USE_LLM') === 'false'
+  const apiKey = forceHeuristic ? undefined : resolveApiKey()
+
+  try {
+    const { data, grounding, modelUsed } = await extract<ExtractionFields>({
+      text: sourceText,
+      promptDescription: PROMPT_DESCRIPTION,
+      examples: RULE_EXAMPLES,
+      schema: ExtractionSchema,
+      apiKey,
+      modelName: getRuntimeEnv('NL_MODEL'),
+    })
+
+    return { ...data, grounding, source: modelUsed }
+  } catch (error) {
+    // NO_API_KEY is an expected, silent fallback. Anything else, we still
+    // degrade gracefully to the heuristic rather than failing the parse.
+    void (error instanceof Error && error.message === NO_API_KEY)
+    return parseHeuristic(sourceText)
+  }
+}
+
+// ── Deterministic fallback parser ────────────────────────────────
+
+const KNOWN_PLATFORMS: Array<{ match: string; label: string }> = [
+  { match: 'amazon india', label: 'Amazon India' },
+  { match: 'amazon', label: 'Amazon' },
+  { match: 'flipkart', label: 'Flipkart' },
+  { match: 'myntra', label: 'Myntra' },
+  { match: 'meesho', label: 'Meesho' },
+  { match: 'ajio', label: 'Ajio' },
+  { match: 'nykaa', label: 'Nykaa' },
+  { match: 'noon', label: 'Noon' },
+]
+
+const CART_WORDS = /\b(cart|order|orders|basket|spend|spending|purchase|purchases|bill|total)\b/i
+
+function ground(text: string, spans: Record<string, string | null | undefined>): Grounding[] {
+  return locateSpans(text, spans)
+}
+
+function titleCase(value: string): string {
+  return value
+    .trim()
+    .split(/\s+/)
+    .map((word) =>
+      word.length <= 3 && word === word.toUpperCase()
+        ? word
+        : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+    )
+    .join(' ')
+}
+
+function toNumber(raw: string): number {
+  return Number(raw.replace(/[,\s]/g, ''))
+}
+
+const LEADING_CONNECTORS = /^(?:on|off|for|across|all|the|of|get|at|a|an)\s+/i
+
+/** Strip connector words a greedy lead-in may have pulled into a brand capture. */
+function cleanLabel(raw: string): string {
+  let s = raw.trim()
+  while (LEADING_CONNECTORS.test(s)) s = s.replace(LEADING_CONNECTORS, '')
+  return s.trim()
+}
+
+type Detected<T> = { value: T; raw: string } | null
+
+/** Percentage: "20%", "20 %", "20 percent", "20 per cent", "20pct". */
+function detectPercentage(text: string): Detected<number> {
+  // %: no trailing \b (it sits between two non-word chars and would never match).
+  // Word forms (percent / per cent / pct): require \b so "pctx" doesn't match.
+  const m = text.match(/(\d+(?:\.\d+)?)\s*(?:%|(?:per\s?cent|percent|pct)\b)/i)
+  return m ? { value: Number(m[1]), raw: m[0] } : null
+}
+
+/**
+ * Flat amount: currency-prefixed ("Rs.100", "₹100", "INR 100"),
+ * currency-suffixed ("100 rupees"), "flat 100", "100 off", or "off 100".
+ * Only called when no percentage is present, so a bare number is the discount.
+ */
+function detectFlat(text: string): Detected<number> {
+  const patterns = [
+    /(?:rs\.?|inr|₹)\s*(\d[\d,]*)/i,
+    /(\d[\d,]*)\s*(?:rupees?|rs\b|inr|₹)/i,
+    /flat\s+(?:rs\.?\s*)?(\d[\d,]*)/i,
+    /(\d[\d,]*)\s*(?:rs\.?\s*)?off\b/i,
+    /(?:off|discount\s+of)\s+(?:rs\.?\s*)?(\d[\d,]*)/i,
+  ]
+  for (const pattern of patterns) {
+    const m = text.match(pattern)
+    if (m) return { value: toNumber(m[1]), raw: m[0] }
+  }
+  return null
+}
+
+/**
+ * Cart threshold: "more than 5000", "above Rs.5,000", "over 4000",
+ * "at least 3000", "minimum order of 5000", "spend 5000", "5000 or more".
+ */
+function detectThreshold(text: string): Detected<number> {
+  const patterns = [
+    /(?:more than|greater than|above|over|at\s*least|min(?:imum)?(?:\s+(?:order|cart|purchase|spend))?(?:\s+(?:value|total))?(?:\s+of)?|≥|>=|=>|>)\s*(?:rs\.?|inr|₹)?\s*(\d[\d,]*)/i,
+    /(?:spend(?:ing)?|cart\s+(?:value|total)|order\s+(?:value|total)|bill)\s+(?:of\s+|is\s+)?(?:rs\.?|inr|₹)?\s*(\d[\d,]*)/i,
+    /(?:rs\.?|inr|₹)?\s*(\d[\d,]*)\s*(?:or more|and above|or above|\+)/i,
+  ]
+  for (const pattern of patterns) {
+    const m = text.match(pattern)
+    if (m) return { value: toNumber(m[1]), raw: m[0] }
+  }
+  return null
+}
+
+/**
+ * Stackable, with explicit negation handling. Negatives are checked first so
+ * "non stackable" / "doesn't stack" resolve to false rather than matching the
+ * positive "stack" substring. Returns null only when the text is silent on it.
+ */
+function detectStackable(text: string): Detected<boolean> {
+  const negative = text.match(
+    /\b(?:non[-\s]?stack(?:able|ing)?|not\s+stack(?:able|ing)?|no\s+stack(?:ing|able)?|do(?:es)?\s*n['’]?t\s+stack|cannot\s+stack|can['’]?t\s+stack|not\s+combinable|cannot\s+be\s+combined|can['’]?t\s+be\s+combined)\b/i
+  )
+  if (negative) return { value: false, raw: negative[0] }
+
+  const positive = text.match(/stackable|stacks?\b|combine[sd]?\s+with|on top of/i)
+  if (positive) return { value: true, raw: positive[0] }
+
+  return null
+}
+
+type Target = { scope: 'platform' | 'brand'; label: string; phrase: string } | null
+
+/** Strict target: a known platform, or a phrase that explicitly says "brand"/"products". */
+function detectTarget(text: string): Target {
   const lower = text.toLowerCase()
 
-  const knownPlatforms = ['amazon india', 'amazon', 'flipkart', 'myntra', 'meesho', 'noon']
-
-  function detectPlatformTarget(): string | null {
-    const explicit = knownPlatforms.find((platform) => lower.includes(platform))
-    if (explicit) {
-      if (explicit === 'amazon india') return 'Amazon India'
-      if (explicit === 'amazon') return 'Amazon'
-      if (explicit === 'flipkart') return 'Flipkart'
-      if (explicit === 'myntra') return 'Myntra'
-      if (explicit === 'meesho') return 'Meesho'
-      if (explicit === 'noon') return 'Noon'
-    }
-
-    const patternMatch = text.match(/(?:on|for)\s+([A-Za-z0-9 ]+?)\s+(?:items?|products?|orders?)/i)
-    if (patternMatch && patternMatch[1]) {
-      const target = patternMatch[1].trim()
-      if (target) {
-        return target
-      }
-    }
-
-    return null
+  const platform = KNOWN_PLATFORMS.find((p) => lower.includes(p.match))
+  if (platform) {
+    const idx = lower.indexOf(platform.match)
+    return { scope: 'platform', label: platform.label, phrase: text.slice(idx, idx + platform.match.length) }
   }
 
-  // Detect stackable mention
-  const stackable = /stackable/.test(lower)
-
-  // Detect percentage like "20%" or "10%"
-  const pctMatch = text.match(/(\d+(?:\.\d+)?)\s*%/) || text.match(/(\d+(?:\.\d+)?)%/)
-  if (pctMatch) {
-    const value = Number(pctMatch[1])
-    // Check for cart-value condition
-    const minMatch = text.match(/(?:more than|above|over|>)[^\d]*(?:rs\.?\s*)?(\d[\d,]*)/i)
-    const min = minMatch ? Number(minMatch[1].replace(/,/g, '')) : null
-
-    // brand mention
-    const brandMatch = text.match(/for\s+([A-Za-z0-9 ]+) brand/i) || text.match(/for\s+([A-Za-z0-9 ]+)/i)
-    const platformTarget = detectPlatformTarget()
-
-    // If text mentions "cart" treat as cart-scope
-    const isCart = /cart/.test(lower) || /if cart value/.test(lower) || /cart value/.test(lower)
-
-    if (isCart) {
-      return {
-        scope: 'cart',
-        appliesTo: null,
-        type: 'percentage',
-        value,
-        stackable: stackable || null,
-        minCartValue: min,
-        confidence: 'complete',
-      }
-    }
-
-    if (platformTarget && !/brand/i.test(platformTarget)) {
-      return {
-        scope: 'platform',
-        appliesTo: platformTarget,
-        type: 'percentage',
-        value,
-        stackable: stackable || null,
-        minCartValue: null,
-        confidence: 'complete',
-      }
-    }
-
-    // If we have a brand-like phrase
-    if (brandMatch && !/cart/.test(brandMatch[1])) {
-      const appliesTo = brandMatch[1].trim()
-      return {
-        scope: 'brand',
-        appliesTo,
-        type: 'percentage',
-        value,
-        stackable: stackable || null,
-        minCartValue: null,
-        confidence: 'complete',
-      }
-    }
-
-    // Fallback: partial confidence
-    return {
-      scope: null,
-      appliesTo: null,
-      type: 'percentage',
-      value,
-      stackable: stackable || null,
-      minCartValue: min,
-      confidence: 'partial',
+  const brandPatterns = [
+    /\bfor\s+([A-Za-z][A-Za-z0-9 ]*?)\s+brand\b/i,
+    /\b([A-Za-z][A-Za-z0-9 ]*?)\s+brand\b/i,
+    /\bbrand\s+([A-Za-z][A-Za-z0-9 ]+?)\b/i,
+    /(?:on|for|across|off)\s+(?:all\s+)?([A-Za-z][A-Za-z0-9 ]*?)\s+(?:items?|products?|range|collection|catalogue)\b/i,
+  ]
+  for (const pattern of brandPatterns) {
+    const m = text.match(pattern)
+    const label = cleanLabel(m?.[1] ?? '')
+    if (label && !CART_WORDS.test(label) && !/^(the|all|big|small|large|every)$/i.test(label)) {
+      return { scope: 'brand', label: titleCase(label), phrase: label }
     }
   }
 
-  // Detect flat amounts like "Rs.100" or "Rs 100" or "100 rupees"
-  const rsMatch = text.match(/rs\.?\s*(\d[\d,]*)/i) || text.match(/(\d[\d,]*)\s*(?:rupee|rs\b)/i)
-  if (rsMatch) {
-    const value = Number(rsMatch[1].replace(/,/g, ''))
+  return null
+}
 
-    // If mention "all Flipkart items" => platform
-    if (/flipkart/i.test(text) || /amazon|flipkart|myntra/i.test(text)) {
-      return {
-        scope: 'platform',
-        appliesTo: /flipkart/i.test(text) ? 'Flipkart' : null,
-        type: 'flat',
-        value,
-        stackable: stackable || null,
-        minCartValue: null,
-        confidence: 'complete',
-      }
-    }
+/**
+ * Weak fallback: a "for/on <X>" target with no "brand"/"products" keyword.
+ * Used only when there is no threshold and no cart language, so the most
+ * likely reading is a brand the user named directly.
+ */
+function detectGenericBrand(text: string): { label: string; phrase: string } | null {
+  const m = text.match(
+    /\b(?:for|on|across|off)\s+(?:(?:everything|anything)\s+)?(?:all\s+)?(?:from\s+)?([A-Za-z][A-Za-z0-9'’]*(?:\s+[A-Za-z][A-Za-z0-9'’]*){0,2})/i
+  )
+  const label = cleanLabel(m?.[1] ?? '')
+  if (!label) return null
+  if (CART_WORDS.test(label) || /\b(items?|products?|everything|stuff)\b/i.test(label)) return null
+  if (/^(the|all|big|small|large|every)$/i.test(label)) return null
+  return { label: titleCase(label), phrase: label }
+}
 
-    // otherwise treat as unknown
+export function parseHeuristic(text: string): ExtractionResult {
+  const stackable = detectStackable(text)
+  const percentage = detectPercentage(text)
+  const flat = percentage ? null : detectFlat(text)
+  const threshold = detectThreshold(text)
+  const target = detectTarget(text)
+
+  const type: 'percentage' | 'flat' | null = percentage ? 'percentage' : flat ? 'flat' : null
+  const amount = percentage ?? flat
+  const value = amount ? amount.value : null
+
+  // No discount amount at all → nothing usable; let the validator clarify.
+  if (value == null || !amount) {
+    return { ...EMPTY_UNRESOLVABLE, source: 'heuristic', grounding: [] }
+  }
+
+  const stackableSpan = stackable ? { stackable: stackable.raw } : {}
+  const baseSpans = { value: amount.raw, ...stackableSpan }
+
+  // Scope decision:
+  //  1. A threshold with no explicit brand/platform target → cart rule.
+  //  2. An explicit brand/platform target wins.
+  //  3. A bare "for/on <X>" with no threshold/cart language → likely a brand.
+  //  4. Otherwise scope is unknown → partial, so a clarifying question fires.
+
+  if (threshold && !target) {
     return {
-      scope: null,
+      scope: 'cart',
       appliesTo: null,
-      type: 'flat',
+      type,
       value,
-      stackable: stackable || null,
+      stackable: stackable ? stackable.value : null,
+      minCartValue: threshold.value,
+      confidence: 'complete',
+      source: 'heuristic',
+      grounding: ground(text, { ...baseSpans, minCartValue: threshold.raw }),
+    }
+  }
+
+  if (target) {
+    return {
+      scope: target.scope,
+      appliesTo: target.label,
+      type,
+      value,
+      stackable: stackable ? stackable.value : null,
       minCartValue: null,
-      confidence: 'partial',
+      confidence: 'complete',
+      source: 'heuristic',
+      grounding: ground(text, { ...baseSpans, appliesTo: target.phrase }),
     }
   }
 
-  // If nothing detected, unresolvable
+  const genericBrand = threshold ? null : detectGenericBrand(text)
+  if (genericBrand) {
+    return {
+      scope: 'brand',
+      appliesTo: genericBrand.label,
+      type,
+      value,
+      stackable: stackable ? stackable.value : null,
+      minCartValue: null,
+      confidence: 'complete',
+      source: 'heuristic',
+      grounding: ground(text, { ...baseSpans, appliesTo: genericBrand.phrase }),
+    }
+  }
+
   return {
     scope: null,
     appliesTo: null,
-    type: null,
-    value: null,
-    stackable: null,
-    minCartValue: null,
-    confidence: 'unresolvable',
+    type,
+    value,
+    stackable: stackable ? stackable.value : null,
+    minCartValue: threshold ? threshold.value : null,
+    confidence: 'partial',
+    source: 'heuristic',
+    grounding: ground(text, { ...baseSpans, minCartValue: threshold?.raw ?? null }),
   }
 }
 
-export default { extractRule }
+export default { extractRule, parseHeuristic }

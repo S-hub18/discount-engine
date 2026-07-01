@@ -9,7 +9,7 @@ export type CartIssue = {
   reason: string
 }
 
-type CartSource = 'csv' | 'pdf' | null
+type CartSource = 'csv' | 'pdf' | 'catalog' | null
 type RuleSource = 'csv' | 'nl' | null
 
 type CartSnapshot = {
@@ -163,6 +163,7 @@ class CartStore {
 
   private pendingCartIssues: CartIssue[] = []
   private listeners: Set<Listener> = new Set()
+  private seq = 0
 
   constructor() {
     eventBus.on('RuleAdded', ({ rule }) => {
@@ -247,6 +248,62 @@ class CartStore {
       cartIssues: [...issues],
       cartFileName: fileName,
       cartSource: source,
+    }
+    this.recompute()
+    this.emit()
+  }
+
+  /**
+   * Storefront "add to cart" — appends one unit of a catalog product as a
+   * distinct cart item. A stable `productId` is attached so the UI can group
+   * identical units into a single line with a quantity stepper, while the
+   * pricing engine still sees N independent items (correct for flat offers).
+   */
+  addProduct(product: { id: string; product: string; brand: string; platform: string; basePrice: number }) {
+    const item = {
+      itemId: `${product.id}__${++this.seq}`,
+      productId: product.id,
+      product: product.product,
+      brand: product.brand,
+      platform: product.platform,
+      basePrice: product.basePrice,
+    } as CartItem & { productId: string }
+
+    this.state = {
+      ...this.state,
+      cartItems: [...this.state.cartItems, item],
+      cartSource: 'catalog',
+    }
+    this.recompute()
+    this.emit()
+  }
+
+  /** Removes the most recently added unit of a given catalog product. */
+  removeOneOfProduct(productId: string) {
+    const items = this.state.cartItems as Array<CartItem & { productId?: string }>
+    let lastIndex = -1
+    items.forEach((item, index) => {
+      if (item.productId === productId) lastIndex = index
+    })
+    if (lastIndex === -1) return
+
+    this.state = {
+      ...this.state,
+      cartItems: items.filter((_, index) => index !== lastIndex),
+    }
+    this.recompute()
+    this.emit()
+  }
+
+  /** Empties the cart (keeps loaded rules). */
+  clearCart() {
+    this.pendingCartIssues = []
+    this.state = {
+      ...this.state,
+      cartItems: [],
+      cartIssues: [],
+      cartFileName: '',
+      cartSource: null,
     }
     this.recompute()
     this.emit()
